@@ -1,5 +1,7 @@
+package com.dorr.chapter06;
+
 import com.dorr.bean.AdClickLog;
-import com.dorr.bean.HotAdClick;
+import com.dorr.bean.HotAdClickByUser;
 import com.dorr.bean.SimpleAggFunction;
 import org.apache.flink.api.common.functions.MapFunction;
 import org.apache.flink.api.common.state.ListState;
@@ -25,13 +27,13 @@ import java.util.Comparator;
 import java.util.List;
 
 /**
- * 每隔5秒，输出最近10分钟内 不同省份点击最多的广告排名（）
+ * 每隔5秒，输出最近10分钟内 不同用户点击最多的广告排名（）
  *
  * @author dorr
  * @version 1.0
  * @date 2020/9/23 16:06
  */
-public class Flink27_Case_AdClickAnalysis {
+public class Flink28_Case_AdClickAnalysisByUser {
     public static void main(String[] args) throws Exception {
         // 0.创建执行环境
         StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
@@ -65,23 +67,20 @@ public class Flink27_Case_AdClickAnalysis {
 
         // 2.处理数据
         // 2.1 按照 统计维度 分组:省份、广告
-        KeyedStream<AdClickLog, Tuple2<String, Long>> adClickKS = logDS.keyBy(new KeySelector<AdClickLog, Tuple2<String, Long>>() {
+        KeyedStream<AdClickLog, Tuple2<Long, Long>> adClickKS = logDS.keyBy(new KeySelector<AdClickLog, Tuple2<Long, Long>>() {
             @Override
-            public Tuple2<String, Long> getKey(AdClickLog value) throws Exception {
-                return Tuple2.of(value.getProvince(), value.getAdId());
+            public Tuple2<Long, Long> getKey(AdClickLog value) throws Exception {
+                return Tuple2.of(value.getUserId(), value.getAdId());
             }
         });
 
         // 2.2 开窗
-        SingleOutputStreamOperator<HotAdClick> aggDS = adClickKS
+        adClickKS
 //                .timeWindow(Time.minutes(10), Time.seconds(5))
                 .timeWindow(Time.hours(1), Time.minutes(5))
                 .aggregate(
                         new SimpleAggFunction<AdClickLog>(),
-                        new AdCountResultWithWindowEnd());
-        aggDS.print("agg");
-
-        aggDS
+                        new AdCountResultWithWindowEnd())
                 .keyBy(data -> data.getWindowEnd())
                 .process(new TopNAdClick(3))
                 .print();
@@ -89,10 +88,11 @@ public class Flink27_Case_AdClickAnalysis {
         env.execute();
     }
 
-    public static class TopNAdClick extends KeyedProcessFunction<Long, HotAdClick, String> {
+    public static class TopNAdClick extends KeyedProcessFunction<Long, HotAdClickByUser, String> {
 
+        private Integer currentThreshold;
         private Integer threshold;
-        private ListState<HotAdClick> datas;
+        private ListState<HotAdClickByUser> datas;
         private ValueState<Long> triggerTS;
 
         public TopNAdClick(Integer threshold) {
@@ -101,12 +101,12 @@ public class Flink27_Case_AdClickAnalysis {
 
         @Override
         public void open(Configuration parameters) throws Exception {
-            datas = getRuntimeContext().getListState(new ListStateDescriptor<HotAdClick>("datas", HotAdClick.class));
+            datas = getRuntimeContext().getListState(new ListStateDescriptor<HotAdClickByUser>("datas", HotAdClickByUser.class));
             triggerTS = getRuntimeContext().getState(new ValueStateDescriptor<Long>("triggerTS", Long.class));
         }
 
         @Override
-        public void processElement(HotAdClick value, Context ctx, Collector<String> out) throws Exception {
+        public void processElement(HotAdClickByUser value, Context ctx, Collector<String> out) throws Exception {
             // 存数据
             datas.add(value);
             // 模拟窗口触发，注册定时器
@@ -119,20 +119,17 @@ public class Flink27_Case_AdClickAnalysis {
         @Override
         public void onTimer(long timestamp, OnTimerContext ctx, Collector<String> out) throws Exception {
             //
-            List<HotAdClick> hotAdClicks = new ArrayList<>();
-            for (HotAdClick hotAdClick : datas.get()) {
-                System.out.println("datas状态里的数据= " + hotAdClick);
+            List<HotAdClickByUser> hotAdClicks = new ArrayList<>();
+            for (HotAdClickByUser hotAdClick : datas.get()) {
                 hotAdClicks.add(hotAdClick);
             }
-
-            System.out.println("list里的数据=" + hotAdClicks.toString());
             // 清空状态，过河拆桥
             datas.clear();
             triggerTS.clear();
             // 排序
-            hotAdClicks.sort(new Comparator<HotAdClick>() {
+            hotAdClicks.sort(new Comparator<HotAdClickByUser>() {
                 @Override
-                public int compare(HotAdClick o1, HotAdClick o2) {
+                public int compare(HotAdClickByUser o1, HotAdClickByUser o2) {
                     return o2.getClickCount().intValue() - o1.getClickCount().intValue();
                 }
             });
@@ -142,8 +139,8 @@ public class Flink27_Case_AdClickAnalysis {
                     .append("---------------------------------------------------\n");
 
             // 加一个判断逻辑： threshold 是否超过 list的大小
-            threshold = threshold > hotAdClicks.size() ? hotAdClicks.size() : threshold;
-            for (int i = 0; i < threshold; i++) {
+            currentThreshold = threshold > hotAdClicks.size() ? hotAdClicks.size() : threshold;
+            for (int i = 0; i < currentThreshold; i++) {
                 resultStr.append(hotAdClicks.get(i) + "\n");
             }
             resultStr.append("--------------------------------------------------\n\n");
@@ -153,11 +150,11 @@ public class Flink27_Case_AdClickAnalysis {
     }
 
 
-    public static class AdCountResultWithWindowEnd extends ProcessWindowFunction<Long, HotAdClick, Tuple2<String, Long>, TimeWindow> {
+    public static class AdCountResultWithWindowEnd extends ProcessWindowFunction<Long, HotAdClickByUser, Tuple2<Long, Long>, TimeWindow> {
 
         @Override
-        public void process(Tuple2<String, Long> key, Context context, Iterable<Long> elements, Collector<HotAdClick> out) throws Exception {
-            out.collect(new HotAdClick(key.f0, key.f1, elements.iterator().next(), context.window().getEnd()));
+        public void process(Tuple2<Long, Long> key, Context context, Iterable<Long> elements, Collector<HotAdClickByUser> out) throws Exception {
+            out.collect(new HotAdClickByUser(key.f0, key.f1, elements.iterator().next(), context.window().getEnd()));
         }
     }
 
